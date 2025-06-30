@@ -2,245 +2,235 @@ Databricks-Native DevOps Blueprint
 
 A fully “Databricks-only” approach—no local environment mirroring, no in-repo wheel packaging—yet enterprise-grade in security, rollback, CI/CD, and consistency.
 
-## 1. Repository Layout – Why We Organize This Way
+⸻
 
-**What happens:** When a developer opens the repository, they see a consistent, opinionated folder structure.\
-**Why it’s needed:** Predictability accelerates onboarding and reduces cognitive overhead. Clear separation of code, notebooks, configs, and tests prevents accidental misuse of development artifacts in production.\
-**How it fits:** A well-structured repo lays the foundation for reproducible builds, CI enforcement, and environment isolation.
+1. Repository Layout – Why We Organize This Way
 
-```text
+What happens: When a developer opens the repository they see a consistent, opinionated folder structure.
+Why it’s needed: Predictability accelerates onboarding and reduces cognitive overhead. Clear separation of code, notebooks, configs, and tests prevents accidental misuse of development artifacts in production.
+How it fits: A well-structured repo lays the foundation for reproducible builds, CI enforcement, and environment isolation.
+
 your-project/
-├── deep_project_core/        ← Pure Python libraries (portable business logic)
+├── deep_project_core/        ← Pure-Python libraries (portable business logic)
 ├── notebooks/                ← All notebooks (EDA, workflows, smoke tests)
-    ├── eda/ 
-    ├── workflows/ 
-├── requirements/
-│   ├── runtime-baseline-ml.in      ← DBR XX.X ML snapshot
-│   ├── additional-packages-ml.in   ← direct deps
-│   ├── requirements-combined-ml.in ← baseline + additions
-│   └── requirements-ml.txt   ← locked full graph
-│   ├── runtime-baseline.in      ← DBR XX.X ML snapshot
-│   ├── additional-packages.in   ← direct deps
-│   ├── requirements-combined.in ← baseline + additions
-│   └── requirements.txt   ← locked full graph
-│   ├── runtime-baseline-gpu.in      ← DBR XX.X ML snapshot
-│   ├── additional-packages-gpu.in   ← direct deps
-│   ├── requirements-combined-gpu.in ← baseline + additions
-│   └── requirements-gpu.txt   ← locked full graph
-├── init/                     ← Cluster initialization scripts
-├── tests/                    ← Unit, integration, and smoke-test artifacts
-│   ├── unit/                    ← pytest unit tests (1:test per module)
-│   ├── integration/             ← pytest Spark-backed pipeline tests
-│   └── data/                    ← small JSON/CSV fixtures
-├── config/                   ← Environment configs (job JSON templates, secrets mapping)
+│   ├── eda/
+│   ├── workflows/            ← Each notebook maps 1:1 to a Job
+│   └── smoke_tests/
+├── requirements/             ← Dependency inputs & outputs
+│   ├── runtime-baseline.in          # DBR XX.X ML exact snapshot
+│   ├── runtime-baseline.constraints # same snapshot → “≤” constraints
+│   ├── additional-packages.in       # direct deps
+│   ├── requirements-combined.in     # baseline + additions (for conflict checks)
+│   └── requirements-final.txt       # fully-pinned install list
+├── init/                     ← Cluster init scripts
+│   └── setup-env.sh
+├── tests/                    ← Unit, integration & smoke artifacts
+│   ├── unit/
+│   ├── integration/
+│   └── data/
+├── config/                   ← Job JSON templates, env configs, secrets mapping
 ├── databricks.yml            ← Deployment manifest (jobs, clusters, init scripts)
 └── .github/workflows/ci.yml  ← CI pipeline definition
-```
 
-- \`\`: Contains reusable functions and classes without any Databricks-specific imports. This separation ensures we can later extract or wrap this code into a microservice, API, or external library without refactoring `dbutils` calls.
-- \`\`: Subdivided into `eda/`, `workflows/`, and `smoke_tests/`. Each workflow notebook corresponds 1:1 with a Job in Databricks. Keeping EDA notebooks separate prevents accidental scheduling of exploratory code.
-- \`\`: Houses four files:
-  1. `runtime-baseline.in`: Auto-generated snapshot of all DBR 16.4 ML pre-installed packages.
-  2. `additional-packages.in`: Developer-declared extras.
-  3. `requirements-combined.in`: Generated merge of baseline + additions for conflict checking.
-  4. `requirements-final.txt`: Fully resolved, pinned graph injected into clusters.
-- \`\`: Runs on every cluster startup to uninstall stray packages and reinstall only what `requirements-final.txt` dictates, guaranteeing fidelity to CI-validated environments.
-- \`\`:
-  - `unit/`: Fast, pure-Python tests.
-  - `integration/`: Spark-based mini-pipeline runs on tiny JSON data.
-  - `smoke_tests/`: Calls the same pytest suite via notebooks, validating the notebook entry point, job wrapper, and cluster environment.
-- \`\`: New addition. Centralizes job JSON templates (parameterized via Jinja), environment-specific values (S3 buckets, endpoints), and secrets-to-key mapping. Having a single source of truth prevents drift.
-- \`\`: Declares every artifact and the mapping of jobs to clusters across `dev`, `staging`, and `prod`. Infrastructure-as-code ensures deployment consistency.
-- \`\`: Orchestrates CI: unit tests → init scripts → integration & smoke tests → asset bundle deploys.
+	•	deep_project_core/ contains pure-Python business logic without dbutils or Spark imports, ensuring portability.
+	•	notebooks/workflows/ holds production notebooks—each one is scheduled via a job.
+	•	requirements/ tracks exactly what DBR ships, what we add, and the resolved graph we install.
+	•	init/setup-env.sh enforces a clean installation of requirements-final.txt on every cluster start.
+	•	tests/ enforces multi-layer validation: unit, integration (Spark), and smoke tests (the actual job wrapper).
+	•	config/ centralizes JSON templates, Jinja configs, and secret-scope mappings for all environments.
+	•	databricks.yml is our single-source-of-truth for how to push code, init scripts, and jobs into dev, staging, and prod.
+	•	.github/workflows/ci.yml orchestrates all quality gates, deployments, and approvals.
 
----
+⸻
 
-## 2. Dependency Workflow – Ensuring Reproducible Environments
+2. Dependency Workflow – Ensuring Reproducible, Evolvable Environments
 
-**What happens:** We snapshot DBR’s built-in packages, declare additional needs, merge and pin dependencies, then enforce them at cluster startup.
+What happens: We capture the DBR baseline, constrain it, declare our additions, resolve a fully-pinned graph, install it on clusters, and then use our tests to verify any evolution of those constraints.
 
-1. **Snapshot once per DBR version**
+⸻
 
-   ```python
-   import pkg_resources, datetime, pathlib
-   baseline = sorted(f"{p.project_name}=={p.version}" for p in pkg_resources.working_set)
-   pathlib.Path("requirements/runtime-baseline.in").write_text(
-       f"# DBR16.4 ML snapshot {datetime.datetime.utcnow().isoformat()}\n\n" + "\n".join(baseline)
-   )
-   ```
+2.1 Snapshot the Exact DBR Baseline
 
-   *Why:* Captures exactly what Databricks pre-installs, eliminating silent transitive upgrades or downgrades.
+Run once per Runtime upgrade in a clean cluster:
 
-2. **Declare project dependencies** in `additional-packages.in` (e.g., `pandas==2.2.0`).
+import pkg_resources, datetime, pathlib
 
-3. \*\*Run \*\*\`\`
+entries = sorted(f"{p.project_name}=={p.version}"
+                 for p in pkg_resources.working_set)
+header = f"# DBR16.4 ML snapshot {datetime.datetime.utcnow().isoformat()} UTC\n\n"
+pathlib.Path("requirements/runtime-baseline.in") \
+        .write_text(header + "\n".join(entries) + "\n")
 
-   - Merges baseline + additions.
-   - Detects version conflicts early (e.g., if DBR’s `joblib` clashes with `scikit-learn`).\
-     *Why:* Fails fast in CI before any cluster launches with inconsistent libs.
+	•	Why: Guarantees we know exactly what Databricks ships, so no accidental upgrades or downgrades.
 
-4. **Cluster startup (**\`\`**\*\*\*\*)**
+⸻
 
-   ```bash
-   pip freeze | xargs pip uninstall -y    # Wipe stray packages
-   pip install -r requirements-final.txt  # Reinstall pinned graph
-   ```
+2.2 Convert to “≤” Constraints
 
-   *Why:* Ensures every interactive notebook and automated Job runs with the exact, tested dependency graph.
+Turn every pkg==ver into pkg<=ver so pip-compile cannot pick above the DBR ceiling.
 
-**Extension – Containerized Environments**: For even faster startup and stronger isolation, you can build a custom Docker image via Databricks Container Services that bakes in your pinned dependencies. This moves environment enforcement from scripting into infrastructure, reducing cluster spin-up time by \~30–60s.
+from pathlib import Path
 
----
+inp = Path("requirements/runtime-baseline.in")
+out = Path("requirements/runtime-baseline.constraints")
+lines = inp.read_text().splitlines()
+with out.open("w") as f:
+    for line in lines:
+        if line.startswith("#") or "==" not in line:
+            f.write(line + "\n")
+        else:
+            pkg, ver = line.split("==",1)
+            f.write(f"{pkg}<={ver}\n")
 
-## 3. Cluster Roles & Repo Mounts – Siloed Environments in a Single Workspace
+	•	Why: Enforces DBR’s maxima but still allows pip-compile to choose lower versions if needed.
 
-**What happens:** We maintain three stable repo mounts—`-dev`, `-stg`, `-prod`—all under one Databricks workspace but with distinct Git refs.
+⸻
 
-| Path                            | Git Ref               | Job Prefix | Purpose                                          |
-| ------------------------------- | --------------------- | ---------- | ------------------------------------------------ |
-| `/Repos/.../simple-project-dev` | `main` or `feature/*` | `Dev – `   | Daily exploration; breaking changes accepted     |
-| `/Repos/.../simple-project-stg` | `release/x.y-RC`      | `Stg – `   | Dress rehearsal; final QA against near-prod data |
-| `/Repos/.../simple-project`     | `release/x.y`         | `Prod – `  | Live data; zero tolerance for surprises          |
+2.3 Declare Direct Dependencies
 
-- **Asset Bundle deployments** (`databricks bundle deploy`) update each mount’s Git branch without touching job definitions.
-- **RBAC Segmentation**: Enforce least-privilege by assigning distinct IAM/Databricks permissions to each mount so, for example, Dev users cannot accidentally write to Prod.
-- **Environment Promotion CLI**: A simple wrapper (or GitHub Action) automates branch promotion from Dev → Staging → Prod, reducing manual steps and human error.
+Edit requirements/additional-packages.in with only your new direct libraries (e.g. pandas==2.2.0).
 
----
+⸻
 
-## 4. Testing Pyramid – Multi-Layered Validation
+2.4 Resolve & Pin with pip-compile
 
-**What happens:** CI runs three layers of tests in sequence: unit → integration → smoke.
+cd requirements/
+pip install --quiet pip-tools
+pip-compile \
+  additional-packages.in \
+  --constraint=runtime-baseline.constraints \
+  --output-file=requirements-final.txt \
+  --allow-unsafe
 
-1. **Unit tests**
-   - Pure-Python, <1s runtime.
-   - Catches logical bugs early (e.g. off-by-one errors).
-2. **Integration tests**
-   - Spin up a SparkSession on the Dev cluster.
-   - Run pipelines on mini JSON datasets (5–20 rows).
-   - Validate schema, joins, and data transformations.
-3. **Smoke notebook tests**
-   - Launch the actual Databricks Job wrapper as a notebook.
-   - Verifies job definitions, permissions, init scripts, and cluster-scoped configs.
+	•	What: Merges your direct deps with the DBR constraint ceiling, catches any conflicts, and pins every transitive version.
+	•	Why: Fails fast in CI if a new library demands a version above what DBR provides—forcing a conscious decision.
 
-**Additional safeguards:**
+⸻
 
-- **Property-based testing** with Hypothesis for library code to uncover edge cases.
-- **Data drift checks**: Assert on pre-defined distribution thresholds (e.g. null rates, distinct counts) so silent data-quality regressions fail CI.
+2.5 Evolving the Baseline: Live Constraint-Bumping Process
 
-**Why it’s needed:** Each layer catches a different class of error—from simple logic mistakes to environment misconfigurations—before any code reaches production.
+When pip-compile errors on a new library:
+	1.	Developer Workflow on feature branch:
+	•	Install new_lib interactively in Dev mount (%pip install new_lib) and verify code imports.
+	•	Add new_lib==X.Y.Z to additional-packages.in.
+	2.	Run pip-compile (as above).
+	•	If it fails, decide to:
+	•	Upgrade DBR → regenerate runtime-baseline.in & .constraints from a new 17.x cluster, commit changes.
+	•	Pin or replace the new library to respect the existing ceiling.
+	3.	Run Tests on Dev cluster:
 
----
+%pip install -r requirements/requirements-final.txt
+pytest tests/unit
+pytest tests/integration
 
-## 5. Security & Compliance – Automated Scans Everywhere
 
-**What happens:** We integrate CVE and license scanners at commit-time and weekly in production.
+	4.	Open a PR including:
+	•	Updated additional-packages.in
+	•	Regenerated requirements-final.txt
+	•	(If you bumped the ceiling) new runtime-baseline.in & .constraints
+	5.	CI re-validates pip-compile, unit, integration, and security scans against that branch.
+	6.	Merge & Promote → dev deploy → smoke tests → staging/prod as usual.
 
-| Tool           | Purpose                                | CI Command                                                        |
-| -------------- | -------------------------------------- | ----------------------------------------------------------------- |
-| `pip-audit`    | CVE + license metadata                 | `pip-audit --require-licenses -r requirements-final.txt`          |
-| `safety`       | PyPI vulnerability database            | `safety check --file requirements-final.txt`                      |
-| `pip-licenses` | Detect disallowed open-source licenses | `pip-licenses --from=requirements-final.txt --fail-on="GPL;LGPL"` |
+	•	Why: Your own test suite becomes the signal that it’s safe to evolve the DBR ceiling, and every bump is fully audited in Git.
 
-- **CI enforcement**: Any scanner failure blocks the merge.
-- **Weekly live scans**: Scheduled Databricks Job re-runs the same scanners against the running cluster, posting new CVEs to Slack.
-- **Policy-as-Code**: Embed governance rules (e.g. allowed cluster network settings, isolation policies) using Open Policy Agent (OPA) integrated into CI and cluster startup.
-- **Secrets Management**: All tokens and credentials are stored in Databricks Secrets, referenced via `dbutils.secrets.get()`, ensuring no sensitive data in plain text.
+⸻
 
-**Why it’s needed:** Proactively catch vulnerabilities, license violations, and misconfigurations before they impact production or violate compliance mandates.
+3. Cluster Roles & Repo Mounts – Siloed Environments in One Workspace
 
----
+Path	Git Ref	Purpose
+/Repos/...-dev	main or feature/*	Developer sandbox & QA
+/Repos/...-stg	release/x.y-RC	Pre-prod validation
+/Repos/...	release/x.y	Production pipelines
 
-## 6. Rollback Strategy – Fast Recovery Under Pressure
+	•	Asset Bundles deploy a specific branch into each mount without changing job definitions.
+	•	Branch promotion is a simple CLI or GitHub Action that runs:
 
-**What happens:** Keeping two “last known good” release branches (`release/x.y` and `release/x.y-1`) lets us revert prod with one command:
+databricks bundle deploy --target staging --branch release/x.y-RC
+databricks bundle deploy --target prod    --branch release/x.y
 
-```bash
+
+
+⸻
+
+4. Testing Pyramid – Multi-Layered Validation
+	1.	Unit tests (tests/unit/): fast, pure-Python, function-level checks.
+	2.	Integration tests (tests/integration/): SparkSession + tiny JSON fixtures → end-to-end pipeline checks.
+	3.	Smoke tests (notebooks/smoke_tests/): run actual Job notebooks via pytest wrapper, validating init scripts, cluster configs, and entry-point correctness.
+
+	•	Evolving constraints only merges once all three layers pass under the new requirements-final.txt.
+
+⸻
+
+5. Security & Compliance – Automated Scans Everywhere
+	•	CI runs:
+
+pip-audit --require-licenses -r requirements/requirements-final.txt
+safety check --file=requirements/requirements-final.txt
+pip-licenses --from=requirements/requirements-final.txt --fail-on="GPL;LGPL"
+
+
+	•	Weekly Job: re-runs the same scanners against the live Dev & Prod clusters, posting new findings to Slack.
+
+⸻
+
+6. Rollback Strategy – Fast, Atomic Recovery
+	•	Keep two stable release branches (current + previous).
+	•	Rollback command:
+
 databricks bundle deploy --target prod --branch release/x.y-1
-```
 
-- **Atomic switch**: Jobs reference notebook paths; a bundle deploy rewrites code, init scripts, and requirements in one shot.
-- **Job definition store**: We `databricks jobs get --job-id …` and commit the JSON to Git, so a UI deletion or manual tweak can be rehydrated by applying the stored JSON.
-- **Automated rollback drills**: A quarterly scheduled GitHub Action triggers a rollback in a sandbox workspace, runs smoke tests, then redeploys forward—validating our recovery runbooks.
-- **Canary deployments**: For critical pipelines, run 5–10% of prod traffic on the new release first, monitor success, then cut over fully.
 
-**Why it’s needed:** Rapid, reliable recovery is essential for SRE and incident-response teams, minimizing MTTR during outages.
+	•	Automated drills run quarterly in sandbox, verify rollback & forward-deploy via smoke tests.
 
----
+⸻
 
-## 7. CI/CD Workflow – Gatekeeping and Observability
+7. CI/CD Workflow – Gatekeeping & Observability
 
-**What happens:** GitHub Actions orchestrates a multi-stage pipeline:
-
-1. **Unit & security** → 2. **Dev deploy + smoke tests** → 3. **Staging & Prod deploys** (with approvals)
-
-```yaml
 jobs:
   unit:
-    runs-on: ubuntu-latest
-    steps:
-      - checkout, setup Python
-      - pytest tests/unit
-      - pip-audit, safety, pip-licenses
+    steps: checkout → setup-python → pytest tests/unit → security scans
+
   integration:
     needs: unit
     steps:
-      - databricks bundle deploy --target dev --branch ${{ github.head_ref }}
-      - trigger smoke job on Dev cluster; poll success
+      - databricks bundle deploy --target dev --branch ${{github.head_ref}}
+      - trigger & poll Dev smoke job → fail on non-SUCCESS
+
   deploy-prod:
-    needs: [unit, integration]
+    needs: [unit,integration]
     if: startsWith(github.ref, 'refs/heads/release/')
     steps:
-      - approval: manager
-      - databricks bundle deploy --target prod --branch ${{ github.ref_name }}
+      - approval
+      - databricks bundle deploy --target prod --branch ${{github.ref_name}}
       - slack notification
-```
 
-- **Dynamic approvals**: Require manual sign-off for high-risk or data-impacting jobs.
-- **Observability**: Capture job-level metrics (run times, error rates, data volumes) via Databricks Metrics API. Dashboards in Grafana or Databricks SQL monitor SLIs/SLOs and trigger alerts on anomalies.
+	•	Approvals gate high-risk changes.
+	•	Metrics from Databricks Jobs feed into dashboards & alerts.
 
-**Why it’s needed:** Ensures code only advances when all quality gates pass, and lets us track operational health over time.
+⸻
 
----
+8. Why We Avoid Wheel Builds (…for Now)
+	•	Speed: No extra 30–60s per CI run.
+	•	Fidelity: Code is always current in Repos.
+	•	Future-proof: If external packaging is needed, adding a minimal setup.py is trivial.
 
-## 8. Why We Avoid Wheel Builds (…for Now)
+⸻
 
-**What happens:** We import `deep_project_core` directly from the mounted repo rather than building a Python wheel.
+9. Onboarding & Documentation
+	•	Makefile + docs/GETTING_STARTED.md walk through:
+	1.	Repo clone & Databricks Repos mount
+	2.	Secret configuration
+	3.	make setup → dev bundle deploy
+	4.	Running smoke tests & viewing dashboards
 
-- **Speed**: Avoids 30–60s per CI run for wheel creation.
-- **Fidelity**: No extra artifacts to version; code is always current in the mounted repo.
-- **Future-proof**: If we later expose `deep_project_core` as an external library, adding a minimal `setup.py` and wheel build is trivial.
+⸻
 
-**Why it’s needed:** Simplifies the pipeline while meeting all current Databricks-only use cases.
+10. Disaster Recovery – Beyond Code
+	•	Delta Lake backups to separate storage.
+	•	Unity Catalog exports of schemas & policies.
+	•	DR runbooks for full workspace and data restoration.
 
----
+⸻
 
-## 9. Onboarding & Documentation – Getting Up and Running
-
-**What happens:** We provide a `Makefile` and `docs/GETTING_STARTED.md` that guide new developers through:
-
-1. Forking/cloning the repo
-2. Installing local CLI tools (`databricks-cli`, Python dependencies)
-3. Setting up Databricks Secrets and config variables
-4. Running `make setup` to mount repos and deploy a dev bundle
-5. Executing smoke tests and viewing dashboards
-
-**Why it’s needed:** Reduces ramp-up time from days to hours and codifies tribal knowledge into repeatable scripts.
-
----
-
-## 10. Disaster Recovery (DR) – Beyond Code
-
-**What happens:** In addition to code rollback, we ensure data resilience by:
-
-- **Delta Lake backups**: Automated daily snapshots of critical tables to a separate S3/GCS bucket.
-- **Unity Catalog exports**: Periodic exports of table schemas and access policies.
-- **DR runbooks**: Step-by-step guides for restoring data and metadata in a new workspace.
-
-**Why it’s needed:** A true DR plan covers both code and data, ensuring business continuity even in catastrophic failures.
-
----
-
-**Closing Note**\
-By embedding each stage—code structure, dependency management, environment isolation, multi-layer testing, security scans, rollback capabilities, CI/CD gates, observability, and DR—directly into the Databricks ecosystem, we achieve a seamless, enterprise-grade DevOps pipeline. Developers never leave the platform they know, while operators gain confidence that every production notebook runs exactly the code and dependencies validated in CI.
-
+Closing Note
+By embedding a live, test-driven constraint-bumping workflow into our Databricks-only pipeline, we achieve both reproducibility and evolvability. Developers can safely add new libraries, use their tests as proof points, and only then update our DBR baseline—maintaining zero-surprise deployments and enterprise-grade control throughout the lifecycle.
